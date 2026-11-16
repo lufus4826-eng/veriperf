@@ -21,9 +21,14 @@ sys.path.insert(0, str(TARGET_ROOT))
 
 # Optional: import canonical_hash from <skill_dir>/scripts/vp.py, or normalize floats/keys inline
 import hashlib
-def canonical_hash(val, digits=6):
+def canonical_hash(val, digits=6, sig_figs=None):
     def norm(v):
-        if isinstance(v, float): r = round(v, digits); return 0.0 if r == 0.0 else r
+        if isinstance(v, float):
+            if v == 0.0: return 0.0
+            if sig_figs: r = float(f"{v:.{sig_figs}g}")
+            elif 1e-12 <= abs(v) < 10.0 ** (-digits): r = float(f"{v:.{digits}g}")
+            else: r = round(v, digits)
+            return 0.0 if r == 0.0 else r
         if isinstance(v, dict): return {str(k): norm(val_k) for k, val_k in sorted(v.items())}
         if isinstance(v, (list, tuple)): return [norm(x) for x in v]
         return v

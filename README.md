@@ -1,7 +1,8 @@
 # VeriPerf ⚡📊
 
 [![Agent Skills Standard](https://img.shields.io/badge/Agent%20Skills-Compliant-blue.svg)](https://agentskills.io)
-[![Version](https://img.shields.io/badge/Version-1.1.0-purple.svg)](https://github.com/lufus4826-eng/veriperf/releases/tag/v1.1.0)
+[![CI](https://github.com/lufus4826-eng/veriperf/actions/workflows/ci.yml/badge.svg)](https://github.com/lufus4826-eng/veriperf/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/Version-1.1.1-purple.svg)](https://github.com/lufus4826-eng/veriperf/releases/tag/v1.1.1)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/Platforms-Claude%20Code%20%7C%20Antigravity%20%7C%20Cursor%20%7C%20Windsurf-green.svg)](#installation)
 [![OS](https://img.shields.io/badge/OS-Windows%20%7C%20macOS%20%7C%20Linux-orange.svg)](#supported-stacks--language-adapters)
@@ -132,7 +133,7 @@ flowchart TD
 | `sandbox --s S --mode create\|opt\|save\|rollback\|diff\|clean [--id ID] [--force]` | Clones project into `S/sandbox-opt/` (preserving `vendor/`, excluding `.git`/caches/build dirs), saves/restores per-target checkpoints (`save`/`rollback`), prints `<=8,000`-char unified diffs (`diff`), or removes sandboxes and verifies `fs-before.txt` vs `fs-after.txt` (`clean`). |
 | `log --s S [--status "..."] [--entry "..."]` | Atomically updates `Status:` on line 1 of `S/worklog.md` and appends timestamped 1-line entries without rewriting the file. |
 | `summary --s S` | Generates ready-to-embed Markdown comparison tables from session JSON logs (`ACCEPTED` and `REJECTED` targets) without reading raw logs. |
-| `canonical-hash [--float-digits 6] [--unordered-lists] [--json-str "..."]` | Computes deterministic float-rounded / key-sorted SHA-256[:16] digests for JSON values (used directly or imported as `vp.canonical_hash`). |
+| `canonical-hash [--float-digits 6] [--sig-figs N] [--unordered-lists] [--json-file PATH \| --json-str STR]` | Computes deterministic float-rounded (or scientific significant-figure) / key-sorted SHA-256[:16] digests via `stdin`, `--json-file` (safe for large outputs on Windows), or `--json-str`. |
 
 ### `VERIPERF_METRIC:` Harness Protocol
 Language harnesses write one JSON line per workload tier to stdout:
@@ -167,6 +168,8 @@ veriperf/
 ├── LICENSE                           # MIT License
 ├── scripts/
 │   └── vp.py                         # Zero-dependency stdlib Python CLI engine (v1.1)
+├── tests/
+│   └── test_vp_cli.py                # Cross-platform unit & integration test suite
 ├── examples/
 │   └── portfolio_bench/              # 1-command runnable demo + sample-perf-report.md
 └── resources/

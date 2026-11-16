@@ -130,46 +130,87 @@ DEFAULT_MAX_MEM_GROWTH_PCT = 25.0
 MEM_NOISE_DEADBAND_KB = 16.0
 
 
-def canonicalize_value(val: Any, float_digits: int = 6, unordered_lists: bool = False) -> Any:
-    """Normalize floats (-0.0 -> 0.0, rounded), sorted dict keys, and optional unordered lists."""
+def canonicalize_value(
+    val: Any,
+    float_digits: int = 6,
+    unordered_lists: bool = False,
+    sig_figs: Optional[int] = None,
+) -> Any:
+    """Normalize floats (-0.0 -> 0.0, fixed decimals or sig-figs), sorted dict keys, and optional unordered lists."""
     if isinstance(val, bool) or val is None or isinstance(val, (int, str)):
         return val
     if isinstance(val, float):
         if math.isnan(val) or math.isinf(val):
             return str(val)
-        rounded = round(val, float_digits)
+        if val == 0.0:
+            return 0.0
+        if sig_figs is not None and sig_figs > 0:
+            rounded = float(f"{val:.{sig_figs}g}")
+        else:
+            tiny_threshold = 10.0 ** (-float_digits)
+            if 1e-12 <= abs(val) < tiny_threshold and float_digits > 0:
+                rounded = float(f"{val:.{float_digits}g}")
+            else:
+                rounded = round(val, float_digits)
         return 0.0 if rounded == 0.0 else rounded
     if isinstance(val, dict):
         return {
-            str(k): canonicalize_value(v, float_digits, unordered_lists)
+            str(k): canonicalize_value(v, float_digits, unordered_lists, sig_figs)
             for k, v in sorted(val.items(), key=lambda kv: str(kv[0]))
         }
     if isinstance(val, (set, frozenset)):
-        items = [canonicalize_value(x, float_digits, unordered_lists) for x in val]
+        items = [canonicalize_value(x, float_digits, unordered_lists, sig_figs) for x in val]
         items.sort(key=lambda x: json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
         return items
     if isinstance(val, (list, tuple)):
-        items = [canonicalize_value(x, float_digits, unordered_lists) for x in val]
+        items = [canonicalize_value(x, float_digits, unordered_lists, sig_figs) for x in val]
         if unordered_lists:
             items.sort(key=lambda x: json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
         return items
     return str(val)
 
 
-def canonical_hash(val: Any, float_digits: int = 6, unordered_lists: bool = False) -> str:
+def canonical_hash(
+    val: Any,
+    float_digits: int = 6,
+    unordered_lists: bool = False,
+    sig_figs: Optional[int] = None,
+) -> str:
     """Return deterministic 16-char SHA-256 hex digest tolerant of float epsilon and key order."""
-    canon = canonicalize_value(val, float_digits=float_digits, unordered_lists=unordered_lists)
+    canon = canonicalize_value(
+        val,
+        float_digits=float_digits,
+        unordered_lists=unordered_lists,
+        sig_figs=sig_figs,
+    )
     encoded = json.dumps(canon, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 def cmd_canonical_hash(args: argparse.Namespace) -> int:
-    raw = args.json_str if args.json_str is not None else sys.stdin.read()
+    if args.sig_figs is not None and int(args.sig_figs) <= 0:
+        raise SystemExit("[vp.py] ERROR: --sig-figs must be >= 1")
+    if args.json_file:
+        fp = Path(args.json_file)
+        if not fp.is_file():
+            raise SystemExit(f"[vp.py] ERROR: JSON file not found: {fp}")
+        raw = fp.read_text(encoding="utf-8")
+    elif args.json_str is not None and args.json_str != "-":
+        raw = args.json_str
+    else:
+        raw = sys.stdin.read()
     try:
         val = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise SystemExit(f"[vp.py] ERROR: invalid JSON input ({exc})")
-    print(canonical_hash(val, float_digits=int(args.float_digits), unordered_lists=bool(args.unordered_lists)))
+    print(
+        canonical_hash(
+            val,
+            float_digits=int(args.float_digits),
+            unordered_lists=bool(args.unordered_lists),
+            sig_figs=int(args.sig_figs) if args.sig_figs is not None else None,
+        )
+    )
     return 0
 
 
@@ -2251,8 +2292,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_ch = sub.add_parser("canonical-hash", help="Compute canonical SHA-256[:16] digest for JSON data")
     p_ch.add_argument("--float-digits", type=int, default=6, help="Decimal digits to round floats (default 6)")
+    p_ch.add_argument("--sig-figs", type=int, default=None, help="Round floats to N significant figures (scientific mode)")
     p_ch.add_argument("--unordered-lists", action="store_true", help="Sort list elements canonically before hashing")
-    p_ch.add_argument("--json-str", default=None, help="JSON string (reads stdin if omitted)")
+    p_ch.add_argument("--json-file", default=None, help="Read JSON payload from file (avoids Windows CLI length limits)")
+    p_ch.add_argument("--json-str", default=None, help="JSON string (reads stdin if omitted or '-')")
     p_ch.set_defaults(func=cmd_canonical_hash)
 
     return parser

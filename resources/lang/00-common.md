@@ -9,7 +9,7 @@ Used with `resources/lang/<lang>.md`. Resolve `<VP>` as `<skill_dir>/scripts/vp.
 - `python "<VP>" bench-run --s "$S" --id <ID> --phase baseline|opt [--warmup 5] [--runs 20] [--tier all] -- <cmd...>` -> enforces `warmup >= 3`, `runs >= 15`, saves `S/logs/<id>_<phase>.json`, emits `<=10`-line digest (`p50`, `p95`, `mean`, `cv%`, `peak_kb`, `hash`).
 - `python "<VP>" verify-opt --s "$S" --id <ID> [--min-speedup 15.0] [--max-mem-growth 25.0] [--allow-mem-tradeoff] [--interleave auto] [--auto-rollback] [--test-cmd "..."]` -> runs Gate 1 (`test-cmd` exit 0 + no broken test signals + exact `result_hash` match) AND Gate 2 (`p50 >= +15%`, `p95 >= 0%`, `mem_growth <= +25%` unless `--allow-mem-tradeoff`). Auto-runs counterbalanced `ABBA` interleaved rounds when `p50` gain is `12–18%` or `CV > 5%`, and rolls back rejected edits cleanly when `--auto-rollback` is set.
 - `python "<VP>" sandbox --s "$S" --mode opt|save|rollback|diff|clean [--id <ID>] [--force]` -> manages `S/sandbox-opt/`, per-target checkpoints (`save`/`rollback`), compact unified diff (`<=8,000` chars), and cleanliness (`fs-before.txt` vs `fs-after.txt`).
-- `python "<VP>" canonical-hash [--float-digits 6] [--unordered-lists] [--json-str "..."]` -> deterministic float-rounded / key-sorted SHA-256[:16] digest.
+- `python "<VP>" canonical-hash [--float-digits 6] [--sig-figs N] [--unordered-lists] [--json-file PATH | --json-str STR]` -> deterministic float-rounded / key-sorted SHA-256[:16] digest (prefers `stdin` or `--json-file` for multi-MB payloads on Windows).
 - `python "<VP>" log --s "$S" [--status "..."] [--entry "..."]` -> atomic worklog update (always fuse with next turn).
 - `python "<VP>" summary --s "$S"` -> emits ready-to-use Markdown tables for Phase 5.
 
@@ -31,6 +31,7 @@ VERIPERF_METRIC:{"tier":"small","warmup":5,"runs":20,"samples_ns":[1240100,...],
 
 ## 4. Canonical Result Hashing (Float & Unordered Safety)
 To prevent false Gate 1 hash mismatches from IEEE-754 associative float rounding (`0.1 + 0.2` vs `0.3`, `-0.0` vs `0.0`) or unordered parallel reductions:
-- Round floating-point leaves to fixed decimal precision (`6` digits by default; normalize `-0.0 -> 0.0`).
+- Round floating-point leaves to fixed decimal precision (`6` digits by default; normalize `-0.0 -> 0.0`). Tiny scientific values (`1e-12 <= |x| < 10^-digits`) automatically preserve significant figures rather than collapsing to `0.0`, or pass `--sig-figs N` explicitly.
 - Sort dictionary/object keys recursively before serialization (`sort_keys=True`).
-- If return order is semantically irrelevant (sets/concurrent workers), sort elements canonically before hashing (`vp.canonical_hash(val, float_digits=6, unordered_lists=True)` or `vp.py canonical-hash --unordered-lists`).
+- If return order is semantically irrelevant (sets/concurrent workers), sort elements canonically before hashing (`vp.canonical_hash(val, float_digits=6, unordered_lists=True)`).
+- For large payloads on Windows (avoiding 8KB/32KB command-line limits), pipe via `stdin` or pass `--json-file path/to/out.json`.
