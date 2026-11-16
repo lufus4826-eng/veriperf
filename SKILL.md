@@ -8,11 +8,11 @@ description: Use when asked to find performance bottlenecks, profile execution s
 Goal: Find performance bottlenecks **empirically proven via statistical benchmarking** (never visual guessing). Deliver `S/perf-report.md` with reproducible harnesses and sandbox-verified unified diffs without modifying host files before explicit user approval.
 
 **Supreme Principle (Dual Gate):** No optimization is valid on intuition alone. Every candidate MUST pass **both** gates:
-1. **Correctness Gate:** `0` existing project test failures AND 100% identical output checksum (`result_hash`) across all tiers before and after.
-2. **15% Speedup Gate:** `>= 15.0%` `p50` improvement on the primary tier (and zero `p95` regression). Any change gaining `< 15.0%` is automatically **REJECTED** as machine noise and reverted from `S/sandbox-opt/`.
+1. **Correctness Gate:** `0` existing project test failures AND 100% identical canonical output checksum (`result_hash`) across all tiers before and after.
+2. **Speedup & Memory Gate:** `>= 15.0%` `p50` improvement on the primary tier, zero `p95` regression, and peak memory growth `<= +25.0%` (unless user explicitly authorizes `--allow-mem-tradeoff`). Borderline (`12–18%`) or high-variance (`CV > 5%`) candidates automatically re-run counterbalanced **ABBA interleaved** checks (`--interleave auto`), and any rejected edit is rolled back deterministically via `vp.py`.
 
 ## Default Parameters
-`WARMUP=5` (`3–5`, hard min `3`) | `RUNS=20` (`15–30`, hard min `15`) | `MIN_SPEEDUP=15.0%` (hard floor) | `TIERS=small,medium,large` | `S=.bughunt/perf-<YYYYMMDD-HHMMSS>/` | `VP=<skill_dir>/scripts/vp.py` | **Language:** Auto-match user prompt language (Thai or English; keep standard technical terms like *p50*, *p95*, *N+1 query*, *hash map*, *cache hit*, *GC* in English) for chat, `S/worklog.md`, and `S/perf-report.md`.
+`WARMUP=5` (`3–5`, hard min `3`) | `RUNS=20` (`15–30`, hard min `15`) | `MIN_SPEEDUP=15.0%` (hard floor) | `MAX_MEM_GROWTH=25.0%` | `INTERLEAVE=auto` | `TIERS=small,medium,large` | `S=.bughunt/perf-<YYYYMMDD-HHMMSS>/` | `VP=<skill_dir>/scripts/vp.py` | **Language:** Auto-match user prompt language (Thai or English; keep standard technical terms like *p50*, *p95*, *N+1 query*, *hash map*, *cache hit*, *GC* in English) for chat, `S/worklog.md`, and `S/perf-report.md`.
 
 ## Token Efficiency Rules (Mandatory)
 1. **Grep-First & Ranged Reads:** Use `vp.py hotspot-scan` or `rg`/`grep` first, then `read_file` with `StartLine`/`EndLine` (`<=150` lines/call). Never dump whole files or re-read unchanged lines, and **never** read `S/logs/*.log` or `S/logs/*.json` (neither via `read_file` nor `Get-Content`/`cat`).
@@ -58,23 +58,20 @@ Goal: Find performance bottlenecks **empirically proven via statistical benchmar
 
 ## Phase 3 — Sandbox Tuning
 1. **Create Sandbox:** Run `python "<VP>" sandbox --s "$S" --mode opt` (copies `ROOT` into `S/sandbox-opt/`), fused with `vp.py log --status "Phase 3 - Sandbox Tuning" --entry "Baseline captured: opt1 p50=..., ..."`.
-2. **Apply Targeted Optimizations in `S/sandbox-opt/` ONLY:**
-   - Replace `O(N^2)` nested scans with hash maps/sets (`O(N)`).
-   - Batch N+1 queries/requests into bulk lookups or pre-loaded maps.
-   - Stream large files line-by-line / chunked instead of unbounded full-file loads.
-   - Hoist regex compilation, sort keys, or repeated allocations out of loops; use `"".join` / buffers / bounded `@lru_cache`.
-   - Keep each optimization clean and reversible per target inside `S/sandbox-opt/` so rejected candidates (`<15%`) can be cleanly reverted before generating the final diff!
+2. **Checkpoint Before Each Target & Tune in `S/sandbox-opt/` ONLY:**
+   - Before editing target `optN`, snapshot the current `S/sandbox-opt/` state via `python "<VP>" sandbox --s "$S" --mode save --id optN` (so any rejected edit can be rolled back byte-for-byte without touching earlier accepted edits).
+   - Replace `O(N^2)` nested scans with hash maps/sets (`O(N)`), batch N+1 calls, stream large files, hoist regex/allocations, or use bounded caches (`@lru_cache(maxsize=...)` — watch the `+25%` peak memory ceiling).
 
 ## Phase 4 — Dual Gate Check
-1. **Run `verify-opt` per Target:**
+1. **Run `verify-opt` with `--auto-rollback` per Target:**
    ```text
-   python "<VP>" verify-opt --s "$S" --id optN --min-speedup 15.0 --test-cmd "<project test cmd>"
+   python "<VP>" verify-opt --s "$S" --id optN --min-speedup 15.0 --max-mem-growth 25.0 --interleave auto --auto-rollback --test-cmd "<project test cmd>"
    ```
-   (`vp.py` automatically runs the benchmark inside `S/sandbox-opt/` with `VERIPERF_TARGET_ROOT=S/sandbox-opt`, runs `--test-cmd` in `S/sandbox-opt/`, verifies `result_hash` parity + `0` test failures, and checks `p50_speedup_pct >= 15.0%` & `p95_speedup_pct >= 0.0%`).
+   (`vp.py` runs inside `S/sandbox-opt/` with `VERIPERF_TARGET_ROOT=S/sandbox-opt`, runs `--test-cmd`, checks `result_hash` parity, auto-triggers counterbalanced `ABBA` interleaved re-verification on `12–18%` / `CV > 5%` runs, checks `p50 >= +15%`, `p95 >= 0%`, and `mem_growth <= +25%`, saves `_last_accepted` on `ACCEPTED`, and auto-restores the checkpoint on `REJECTED`).
 2. **Enforce Iron Rule:**
-   - `ACCEPTED`: Keep the edit in `S/sandbox-opt/`.
-   - `REJECTED_TEST_FAILURE` / `REJECTED_OUTPUT_MISMATCH`: Fix the correctness issue in `S/sandbox-opt/` (max 2 attempts) and re-run `--rerun`; if still failing, **revert** that target's edit in `S/sandbox-opt/` and mark `REJECTED`.
-   - `REJECTED_INSUFFICIENT_GAIN (<15%)` or `REJECTED_P95_REGRESSION`: **Revert** that target's edit in `S/sandbox-opt/` immediately so only proven `>=15%` changes remain in the diff, while retaining its `optN_verify.json` record for Section 4 of the report.
+   - `ACCEPTED`: Proceed to next target (`_last_accepted` checkpoint updated automatically).
+   - `REJECTED_TEST_FAILURE` / `REJECTED_OUTPUT_MISMATCH` / `REJECTED_MEMORY_BLOWUP`: `--auto-rollback` restores `S/sandbox-opt/` cleanly (never manually hand-edit files back!). Retry up to 2 alternative approaches if promising, or leave reverted and record in Section 4.
+   - `REJECTED_INSUFFICIENT_GAIN (<15%)` or `REJECTED_P95_REGRESSION`: Leave reverted via `--auto-rollback` and record in Section 4.
 
 ## Phase 5 — Benchmark Report & Cleanliness
 1. **Single Fused Prep Turn:** Run one chained shell command:

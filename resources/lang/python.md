@@ -12,12 +12,22 @@
 ## 3. Harness Template (`S/benches/bench_opt1.py`)
 ```python
 # ID: OPT-1 | Target: app/reconcile.py:match_orders
-import gc, hashlib, json, os, sys, time, tracemalloc
+import gc, json, os, sys, time, tracemalloc
 from pathlib import Path
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[3]
 TARGET_ROOT = Path(os.environ.get("VERIPERF_TARGET_ROOT", str(DEFAULT_ROOT)))
 sys.path.insert(0, str(TARGET_ROOT))
+
+# Optional: import canonical_hash from <skill_dir>/scripts/vp.py, or normalize floats/keys inline
+import hashlib
+def canonical_hash(val, digits=6):
+    def norm(v):
+        if isinstance(v, float): r = round(v, digits); return 0.0 if r == 0.0 else r
+        if isinstance(v, dict): return {str(k): norm(val_k) for k, val_k in sorted(v.items())}
+        if isinstance(v, (list, tuple)): return [norm(x) for x in v]
+        return v
+    return hashlib.sha256(json.dumps(norm(val), sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
 
 from app.reconcile import match_orders  # noqa: E402
 
@@ -51,7 +61,7 @@ def bench_tier(tier: str, n: int) -> None:
     _, peak_bytes = tracemalloc.get_traced_memory()
     tracemalloc.stop()
 
-    digest = hashlib.sha256(json.dumps(last_out, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    digest = canonical_hash(last_out)
     print("VERIPERF_METRIC:" + json.dumps({
         "tier": tier, "warmup": WARMUP, "runs": RUNS,
         "samples_ns": samples_ns, "peak_kb": round(peak_bytes / 1024.0, 2), "result_hash": digest,

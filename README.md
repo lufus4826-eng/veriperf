@@ -1,7 +1,7 @@
 # VeriPerf ⚡📊
 
 [![Agent Skills Standard](https://img.shields.io/badge/Agent%20Skills-Compliant-blue.svg)](https://agentskills.io)
-[![Version](https://img.shields.io/badge/Version-1.0.0-purple.svg)](https://github.com/lufus4826-eng/veriperf/releases/tag/v1.0.0)
+[![Version](https://img.shields.io/badge/Version-1.1.0-purple.svg)](https://github.com/lufus4826-eng/veriperf/releases/tag/v1.1.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/Platforms-Claude%20Code%20%7C%20Antigravity%20%7C%20Cursor%20%7C%20Windsurf-green.svg)](#installation)
 [![OS](https://img.shields.io/badge/OS-Windows%20%7C%20macOS%20%7C%20Linux-orange.svg)](#supported-stacks--language-adapters)
@@ -9,36 +9,50 @@
 [![VeriHunt Ecosystem](https://img.shields.io/badge/Ecosystem-VeriHunt-indigo.svg)](https://github.com/lufus4826-eng/verihunt)
 
 > **VeriPerf — Statistical Performance Profiling & Dual-Gate Sandbox Optimization Agent Skill.**  
-> Stop letting AI agents optimize code by visual guesswork. VeriPerf scans for algorithmic and I/O bottlenecks, measures **Small / Medium / Large** workloads across `3–5` warm-up and `15–30` timed iterations (`p50`, `p95`, Peak Memory), tunes code inside an isolated sandbox, and **automatically rejects and reverts** any change that breaks tests, alters output hashes, or gains less than **15%**.
+> Stop letting AI agents optimize code by visual guesswork. VeriPerf scans for algorithmic and I/O bottlenecks, measures **Small / Medium / Large** workloads across `3–5` warm-up and `15–30` timed iterations (`p50`, `p95`, Peak Memory), tunes code inside an isolated sandbox, and **automatically rejects and rolls back** any change that breaks tests, alters output hashes, blows up peak memory, or gains less than **15%**.
 
 ---
 
 ## Why VeriPerf?
 
-When you ask an AI coding agent to *"optimize this code"*, three things usually go wrong:
+When you ask an AI coding agent to *"optimize this code"*, four things usually go wrong:
 1. **Placebo micro-tweaks:** The agent makes code harder to read for a 1–3% speedup that is indistinguishable from CPU jitter.
-2. **Silent regressions:** An aggressive refactor subtly changes edge-case rounding, ordering, or test behavior.
-3. **Token bloat:** Running 20–30 benchmark iterations raw in the shell floods the agent's context window with thousands of lines of noisy stdout.
+2. **RAM blowups disguised as speedups:** Unbounded caching makes code 16% faster while silently spiking peak memory by 500%.
+3. **Thermal/CPU drift & silent regressions:** Sequential timing runs suffer from background load or subtly alter float precision and ordering.
+4. **Token bloat:** Running 20–30 benchmark iterations raw in the shell floods the agent's context window with thousands of lines of noisy stdout.
 
-**VeriPerf solves all three using a deterministic Python CLI engine (`scripts/vp.py`) and strict Dual Gate verification:**
-- **Correctness Gate (Gate 1):** Existing project tests must pass (`exit=0` with zero broken-harness signals) **and** deterministic output checksums (`result_hash`) must match 100% across `small`, `medium`, and `large` tiers.
-- **15% Statistical Speedup Gate (Gate 2):** Primary-tier median latency (`p50`) must improve by **at least 15.0%**, and `p95` tail latency must not regress. Sub-15% edits are automatically flagged `REJECTED` and reverted from `sandbox-opt/`.
-- **Compact Token Footprint:** Multi-tier `p50`/`p95`/memory results are compressed by `vp.py` into **<=10-line** digests so the agent never reads raw JSON/log files.
+**VeriPerf (`v1.1.0`) solves all four using a deterministic Python CLI engine (`scripts/vp.py`) and strict Dual Gate verification:**
+- **Gate 1 (Correctness & Canonical Equivalence):** Project tests must pass (`exit=0` with zero broken-harness signals) **and** canonical output checksums (`canonical_hash`, rounding floats and sorting dict keys) must match 100% across `small`, `medium`, and `large` tiers.
+- **Gate 2 (15% Speedup + Peak Memory Ceiling):** Primary-tier `p50` must improve by **>= 15.0%**, `p95` tail latency must not regress, and peak memory growth must stay **<= +25.0%** (above a 16 KB noise floor, unless `--allow-mem-tradeoff` is explicitly approved).
+- **Counterbalanced `ABBA` Interleaved Re-Verification (`--interleave auto`):** Borderline speedups (`12–18%`) or high-variance runs (`CV > 5%`) automatically trigger interleaved baseline/optimized legs to neutralize CPU thermal throttling.
+- **Deterministic Checkpoints & Auto-Rollback:** Per-target sandbox snapshots (`sandbox --mode save|rollback`, `--auto-rollback`) revert rejected edits byte-for-byte without touching previously accepted optimizations.
 
 ---
 
-## Verified Benchmark Case Study
+## Verified Benchmark Case Study (`examples/portfolio_bench`)
 
-Tested end-to-end (`warmup=5`, `runs=20`, `MIN_SPEEDUP=15.0%`) on a multi-module Python portfolio analytics suite containing `O(N^2)` trade reconciliation, audit-log parsing/concatenation overhead, and an already-linear fee loop:
+Tested end-to-end (`warmup=5`, `runs=20`, `MIN_SPEEDUP=15.0%`, `MAX_MEM_GROWTH=25.0%`) via [`examples/portfolio_bench/run_demo.py`](examples/portfolio_bench/run_demo.py) — see the generated [`sample-perf-report.md`](examples/portfolio_bench/sample-perf-report.md):
 
 | Target | Optimization Tested | Primary Tier | Baseline `p50` | Optimized `p50` | `p50` Speedup | `p95` Change | Peak Memory | Hash | Dual Gate Verdict |
 |---|---|---|---:|---:|---:|---:|---:|---|---|
-| **OPT-1** (`reconcile_trades`) | Replaced `O(N*M)` nested scan with `O(N+M)` hash-map index | `large` | `142.700 ms` | `1.603 ms` | **+98.9% (88.99x)** | +98.8% | -60.3% | MATCH | **ACCEPTED** |
-| **OPT-2** *(Attempt 1)* | Hoisted regex + buffered strings in `list.append` | `large` | `24.844 ms` | `21.300 ms` | **+14.3%** | +13.8% | -537.9% (worse) | MATCH | **REJECTED (`<15%`)** |
-| **OPT-2** *(Attempt 2)* | Streaming length accounting + `O(1)` ASCII slice validation | `large` | `24.844 ms` | `20.774 ms` | **+16.4% (1.20x)** | +16.9% | **+95.5% saved** (`70.2 -> 3.1 KB`) | MATCH | **ACCEPTED** |
-| **OPT-3** (`compute_batch_fees`) | Local variable micro-binding (`rnd = round`) | `large` | `41.046 ms` | `39.714 ms` | **+3.2%** | +5.4% | +9.5% | MATCH | **REJECTED (`<15%`, reverted)** |
+| **OPT-1** (`reconcile_trades`) | Replaced `O(N*M)` nested scan with `O(N+M)` in-place dict index | `large` | `144.637 ms` | `1.802 ms` | **+98.8% (80.25x)** | +98.7% | +16.0% (`<= +25%`) | MATCH | **ACCEPTED** |
+| **OPT-2** *(Attempt 1)* | Hoisted regex + buffered strings in `list.append` | `large` *(interleaved)* | `25.410 ms` | `21.170 ms` | +16.7% | **-33.4% (worse)** | **+537.8% (blowup)** | MATCH | **REJECTED + Auto-Rolled Back** |
+| **OPT-2** *(Attempt 2)* | Streaming length accounting + `O(1)` ASCII slice validation | `large` *(interleaved)* | `25.601 ms` | `21.339 ms` | **+16.6% (1.20x)** | +6.3% | **-95.5% saved** (`70.2 -> 3.1 KB`) | MATCH | **ACCEPTED** |
+| **OPT-3** (`compute_batch_fees`) | Local variable micro-binding (`rnd = round`) | `large` | `41.414 ms` | `40.139 ms` | **+3.1%** | +2.8% | -9.5% | MATCH | **REJECTED (`<15%`) + Auto-Rolled Back** |
 
-> **Key takeaway from OPT-2:** On Python 3.13, a textbook `list.append + "".join` refactor actually *failed* the 15% gate (`+14.3%`) and increased peak memory by 5.4x. Because VeriPerf refused to accept unverified intuition, it forced a true zero-buffer optimization that cut memory by **95.5%** and cleared the **15%** bar.
+> **Key takeaway from OPT-2:** On Python 3.13, a textbook `list.append` buffer refactor triggered automatic `ABBA` interleaved verification (because its initial `+16.3%` gain was near the 15% threshold), revealing a `-33.4%` `p95` tail regression and `+537.8%` peak memory blowup. VeriPerf automatically rolled it back and drove a zero-buffer streaming optimization that cut memory by **95.5%**.
+
+---
+
+## Try the 1-Command Live Demo
+
+Clone the repo and run the full 5-phase VeriPerf v1.1 workflow (including automatic interleaved verification and checkpoint rollback) in one command on an isolated temporary workspace:
+
+```bash
+git clone https://github.com/lufus4826-eng/veriperf.git
+cd veriperf
+python examples/portfolio_bench/run_demo.py
+```
 
 ---
 
@@ -87,12 +101,12 @@ git clone https://github.com/lufus4826-eng/veriperf.git .agents/skills/veriperf
 ```mermaid
 flowchart TD
     A["Phase 0–1: vp.py init + hotspot-scan + Workload Tiers (S/M/L)"] --> B["Phase 2: Write High-Res Harnesses + vp.py bench-run --phase baseline"]
-    B --> C["Phase 3: vp.py sandbox --mode opt + Tune in S/sandbox-opt/ Only"]
-    C --> D["Phase 4: vp.py verify-opt (Tests + Output Hash AND >=15% p50 + No p95 Regression)"]
-    D -- "Gate 1 or Gate 2 FAIL" --> E{"Fixable Correctness / Better Approach?"}
-    E -- "Yes (<=2 retries)" --> C
-    E -- "No (<15% noise)" --> F["Revert Target Edit in sandbox-opt & Log as REJECTED"]
-    D -- "ACCEPTED" --> G["Retain in sandbox-opt Diff"]
+    B --> C["Phase 3: sandbox --mode opt + save --id optN + Tune in sandbox-opt"]
+    C --> D["Phase 4: vp.py verify-opt --interleave auto --auto-rollback (Tests, Hash, >=15% p50, p95, <=25% Mem)"]
+    D -- "Borderline 12-18% / CV>5%" --> D1["Counterbalanced ABBA Interleaved Re-Check"]
+    D1 --> D
+    D -- "REJECTED" --> F["Auto-Restored via Checkpoint + Logged in Section 4"]
+    D -- "ACCEPTED" --> G["Checkpoint _last_accepted Updated & Diff Retained"]
     F --> H["Phase 5: vp.py summary + sandbox --mode diff + sandbox --mode clean -> S/perf-report.md"]
     G --> H
 ```
@@ -101,8 +115,8 @@ flowchart TD
 |---|---|---|
 | **Phase 0–1: Hotspot Discovery** | Locate bottlenecks & define Small / Medium / Large dataset sizes | `vp.py init` + `vp.py hotspot-scan` (`<=35` lines) + `resources/hotspot-patterns.md` |
 | **Phase 2: Baseline Capture** | Capture statistically stable pre-tuning metrics without modifying host code | `vp.py bench-run --phase baseline` (`warmup >= 3`, `runs >= 15`, `p50`, `p95`, `peak_kb`, `result_hash`) |
-| **Phase 3: Sandbox Tuning** | Implement algorithmic, batching, streaming, or caching fixes safely | Isolated copy at `.bughunt/perf-*/sandbox-opt/` via `vp.py sandbox --mode opt` |
-| **Phase 4: Dual Gate Check** | Prove functional equivalence AND statistically meaningful speedup (`>= 15%`) | `vp.py verify-opt` rejects & reverts `<15%` gains, `p95` regressions, hash mismatches, or test failures |
+| **Phase 3: Sandbox Tuning** | Snapshot checkpoint & implement algorithmic, batching, or streaming fixes safely | `vp.py sandbox --mode opt` + `save --id optN` inside `.bughunt/perf-*/sandbox-opt/` |
+| **Phase 4: Dual Gate Check** | Prove equivalence, `>= 15%` speedup, no `p95` regression, & `<= +25%` memory ceiling | `vp.py verify-opt` with `--interleave auto` (`ABBA`) and `--auto-rollback` |
 | **Phase 5: Benchmark Report** | Deliver audit-ready Before/After report and clean temporary sandboxes | `vp.py summary` + `sandbox --mode diff` + `sandbox --mode clean` -> `S/perf-report.md` |
 
 ---
@@ -114,10 +128,11 @@ flowchart TD
 | `init [--root .]` | Creates `.bughunt/perf-<YYYYMMDD-HHMMSS>/{benches,logs,tmp}` + `.cache`, captures `fs-before.txt`, initializes `worklog.md`, and outputs 1-line JSON `{S, SNAME, CACHE, ROOT, snapshot}`. |
 | `hotspot-scan [--root .] [--scope dir] [--s S]` | Runs Python AST + multi-language structural scanning for `NESTED_LOOP`, `N_PLUS_ONE_IO`, `UNBOUNDED_MEMORY_READ`, and `LOOP_ALLOC_OR_RECOMPILE` (excluding test files), printing a ranked `<=35`-line report. |
 | `bench-run --s S --id ID --phase baseline\|opt [--warmup 5] [--runs 20] [--tier all] -- <cmd>` | Enforces `warmup >= 3` and `runs >= 15`, parses `VERIPERF_METRIC:` JSON lines (or times subprocesses as fallback), computes `p50`, `p95`, `mean`, `CV%`, `peak_kb`, and `result_hash`, and prints a **<=10-line** digest. |
-| `verify-opt --s S --id ID [--min-speedup 15.0] [--test-cmd "..."]` | Runs benchmark inside `S/sandbox-opt/`, executes `--test-cmd` (checking exit `0` + broken-harness signals), verifies exact `result_hash` parity across all tiers, and enforces the `>=15.0%` `p50` floor + `p95` non-regression (`<=12`-line digest). |
-| `sandbox --s S --mode create\|opt\|diff\|clean [--force]` | Clones project into `S/sandbox-opt/` (preserving `vendor/`, excluding `.git`/caches/build dirs), prints `<=8,000`-char unified diffs (`diff`), or removes sandboxes and verifies `fs-before.txt` vs `fs-after.txt` (`clean`). |
+| `verify-opt --s S --id ID [--min-speedup 15.0] [--max-mem-growth 25.0] [--allow-mem-tradeoff] [--interleave auto] [--auto-rollback] [--test-cmd "..."]` | Runs inside `S/sandbox-opt/`, executes `--test-cmd` (checking exit `0` + broken-harness signals), verifies `result_hash` parity, auto-triggers counterbalanced `ABBA` interleaving on `12–18%` / `CV > 5%` runs, enforces `p50 >= +15%`, `p95 >= 0%`, and `mem_growth <= +25%`, and rolls back rejected edits cleanly (`<=12`-line digest). |
+| `sandbox --s S --mode create\|opt\|save\|rollback\|diff\|clean [--id ID] [--force]` | Clones project into `S/sandbox-opt/` (preserving `vendor/`, excluding `.git`/caches/build dirs), saves/restores per-target checkpoints (`save`/`rollback`), prints `<=8,000`-char unified diffs (`diff`), or removes sandboxes and verifies `fs-before.txt` vs `fs-after.txt` (`clean`). |
 | `log --s S [--status "..."] [--entry "..."]` | Atomically updates `Status:` on line 1 of `S/worklog.md` and appends timestamped 1-line entries without rewriting the file. |
 | `summary --s S` | Generates ready-to-embed Markdown comparison tables from session JSON logs (`ACCEPTED` and `REJECTED` targets) without reading raw logs. |
+| `canonical-hash [--float-digits 6] [--unordered-lists] [--json-str "..."]` | Computes deterministic float-rounded / key-sorted SHA-256[:16] digests for JSON values (used directly or imported as `vp.canonical_hash`). |
 
 ### `VERIPERF_METRIC:` Harness Protocol
 Language harnesses write one JSON line per workload tier to stdout:
@@ -134,7 +149,7 @@ VERIPERF_METRIC:{"tier":"large","warmup":5,"runs":20,"samples_ns":[1612400,15982
 |---|---|---|---|
 | **Python** | `time.perf_counter_ns()` | `tracemalloc` peak heap (post-timing pass) | `VERIPERF_TARGET_ROOT` + `PYTHONPATH`, `PYTHONDONTWRITEBYTECODE=1` |
 | **Go** | `time.Now()` / `time.Since()` | `runtime.ReadMemStats` `TotalAlloc` delta | `S/sandbox[-opt]/`, `go test -count=1`, `GOCACHE`, `GOPROXY=off` |
-| **Node.js / TS** | `process.hrtime.bigint()` | `process.memoryUsage().heapUsed` | `VERIPERF_TARGET_ROOT` + `NODE_PATH`, `npm_config_offline=true` |
+| **Node.js / TS** | `process.hrtime.bigint()` | `process.memoryUsage().heapUsed` | `pathToFileURL(VERIPERF_TARGET_ROOT)` dynamic `import()` (ESM, CJS & TS), `npm_config_offline=true` |
 | **Java / Kotlin (JVM)** | `System.nanoTime()` | `Runtime` heap / `MemoryMXBean` | `S/sandbox[-opt]/`, `mvn -o` / `gradlew --offline` |
 | **C# (.NET)** | `Stopwatch.GetTimestamp()` | `GC.GetAllocatedBytesForCurrentThread()` | `S/sandbox[-opt]/`, `dotnet test -c Release --no-restore` |
 | **Rust** | `std::time::Instant` + `black_box` | Tracking allocator / RSS | `S/sandbox[-opt]/`, `cargo test --release --offline --locked` |
@@ -151,13 +166,15 @@ veriperf/
 ├── CONTRIBUTING.md                   # Contributor & adapter authoring guide
 ├── LICENSE                           # MIT License
 ├── scripts/
-│   └── vp.py                         # Zero-dependency stdlib Python CLI engine
+│   └── vp.py                         # Zero-dependency stdlib Python CLI engine (v1.1)
+├── examples/
+│   └── portfolio_bench/              # 1-command runnable demo + sample-perf-report.md
 └── resources/
     ├── hotspot-patterns.md           # Bottleneck pattern & remediation catalog
     ├── report-template.md            # English 6-section report template (Phase 5 lazy-load)
     ├── report-template-th.md         # Thai 6-section report template (Phase 5 lazy-load)
     └── lang/                         # Language-specific timing & memory adapters
-        ├── 00-common.md              # VERIPERF_METRIC protocol & statistical rules
+        ├── 00-common.md              # VERIPERF_METRIC protocol, canonical hash & stats rules
         ├── python.md
         ├── go.md
         ├── js-ts.md
@@ -168,7 +185,7 @@ veriperf/
 
 ### Session Output (`.bughunt/perf-<YYYYMMDD-HHMMSS>/`)
 ```text
-.bughunt/perf-20261116-203001/
+.bughunt/perf-20261116-205732/
 ├── perf-report.md        # Final 6-section statistical report & verified diffs
 ├── worklog.md            # Append-only progress journal
 ├── benches/              # Reproducible multi-tier benchmark harnesses

@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Deterministic statistical profiling & dual-gate CLI engine for VeriPerf (stdlib only).
+"""Deterministic statistical profiling & dual-gate CLI engine for VeriPerf v1.1 (stdlib only).
 
 Subcommands:
-  init          Initialize .bughunt/perf-<ts>/ session, snapshot fs-before.txt, worklog.md
-  hotspot-scan  AST + pattern scan for O(N^2) loops, N+1 I/O, unbounded reads, loop allocs
-  bench-run     Run 3-5 warmups + 15-30 timed iterations; emit <=10-line p50/p95/mem digest
-  verify-opt    Enforce Dual Gate (tests + output hash AND >=15% speedup, no p95 regression)
-  sandbox       Manage S/sandbox-opt, compact unified diff (<=8000 chars), and clean check
-  log           Update worklog.md Status line + append timestamped 1-line entries atomically
-  summary       Emit Markdown comparison tables from session JSON logs (no raw log reads)
+  init            Initialize .bughunt/perf-<ts>/ session, snapshot fs-before.txt, worklog.md
+  hotspot-scan    AST + pattern scan for O(N^2) loops, N+1 I/O, unbounded reads, loop allocs
+  bench-run       Run 3-5 warmups + 15-30 timed iterations; emit <=10-line p50/p95/mem digest
+  verify-opt      Enforce Dual Gate (tests + hash, >=15% p50, no p95 regression, mem ceiling, ABBA interleave)
+  sandbox         Manage S/sandbox-opt (opt, save, rollback, diff, clean)
+  log             Update worklog.md Status line + append timestamped 1-line entries atomically
+  summary         Emit Markdown comparison tables from session JSON logs (no raw log reads)
+  canonical-hash  Compute deterministic float-rounded / key-sorted SHA-256[:16] digest
 """
 
 from __future__ import annotations
@@ -125,6 +126,51 @@ METRIC_PREFIX = "VERIPERF_METRIC:"
 MIN_WARMUP = 3
 MIN_RUNS = 15
 HARD_MIN_SPEEDUP_PCT = 15.0
+DEFAULT_MAX_MEM_GROWTH_PCT = 25.0
+MEM_NOISE_DEADBAND_KB = 16.0
+
+
+def canonicalize_value(val: Any, float_digits: int = 6, unordered_lists: bool = False) -> Any:
+    """Normalize floats (-0.0 -> 0.0, rounded), sorted dict keys, and optional unordered lists."""
+    if isinstance(val, bool) or val is None or isinstance(val, (int, str)):
+        return val
+    if isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            return str(val)
+        rounded = round(val, float_digits)
+        return 0.0 if rounded == 0.0 else rounded
+    if isinstance(val, dict):
+        return {
+            str(k): canonicalize_value(v, float_digits, unordered_lists)
+            for k, v in sorted(val.items(), key=lambda kv: str(kv[0]))
+        }
+    if isinstance(val, (set, frozenset)):
+        items = [canonicalize_value(x, float_digits, unordered_lists) for x in val]
+        items.sort(key=lambda x: json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+        return items
+    if isinstance(val, (list, tuple)):
+        items = [canonicalize_value(x, float_digits, unordered_lists) for x in val]
+        if unordered_lists:
+            items.sort(key=lambda x: json.dumps(x, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+        return items
+    return str(val)
+
+
+def canonical_hash(val: Any, float_digits: int = 6, unordered_lists: bool = False) -> str:
+    """Return deterministic 16-char SHA-256 hex digest tolerant of float epsilon and key order."""
+    canon = canonicalize_value(val, float_digits=float_digits, unordered_lists=unordered_lists)
+    encoded = json.dumps(canon, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def cmd_canonical_hash(args: argparse.Namespace) -> int:
+    raw = args.json_str if args.json_str is not None else sys.stdin.read()
+    try:
+        val = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"[vp.py] ERROR: invalid JSON input ({exc})")
+    print(canonical_hash(val, float_digits=int(args.float_digits), unordered_lists=bool(args.unordered_lists)))
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1133,9 +1179,14 @@ def _select_primary_tier(tiers: Dict[str, Dict[str, Any]], preferred: str = "lar
     return max(tiers.keys(), key=lambda t: tiers[t]["p50_ms"])
 
 
-def _parse_metric_lines(log_text: str, cli_warmup: int) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
-    """Parse VERIPERF_METRIC:{...} lines into tier stats. Returns (tiers, error_msg)."""
+def _parse_metric_lines(
+    log_text: str,
+    cli_warmup: int,
+    min_runs: int = MIN_RUNS,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, List[float]], Optional[str]]:
+    """Parse VERIPERF_METRIC:{...} lines into tier stats and raw samples_ms."""
     tiers: Dict[str, Dict[str, Any]] = {}
+    raw_samples: Dict[str, List[float]] = {}
     for raw_ln in log_text.splitlines():
         if not raw_ln.startswith(METRIC_PREFIX):
             continue
@@ -1143,22 +1194,22 @@ def _parse_metric_lines(log_text: str, cli_warmup: int) -> Tuple[Dict[str, Dict[
         try:
             obj = json.loads(json_part)
         except json.JSONDecodeError as exc:
-            return {}, f"HARNESS_INVALID: malformed VERIPERF_METRIC JSON ({exc})"
+            return {}, {}, f"HARNESS_INVALID: malformed VERIPERF_METRIC JSON ({exc})"
 
         tier = str(obj.get("tier", "default")).strip() or "default"
         w = int(obj.get("warmup", cli_warmup))
         if w < MIN_WARMUP:
-            return {}, f"HARNESS_INVALID: tier={tier} reported warmup={w} < {MIN_WARMUP}"
+            return {}, {}, f"HARNESS_INVALID: tier={tier} reported warmup={w} < {MIN_WARMUP}"
 
         if "samples_ns" in obj and isinstance(obj["samples_ns"], list):
             samples_ms = [float(x) / 1_000_000.0 for x in obj["samples_ns"]]
         elif "samples_ms" in obj and isinstance(obj["samples_ms"], list):
             samples_ms = [float(x) for x in obj["samples_ms"]]
         else:
-            return {}, f"HARNESS_INVALID: tier={tier} missing samples_ns/samples_ms list"
+            return {}, {}, f"HARNESS_INVALID: tier={tier} missing samples_ns/samples_ms list"
 
-        if len(samples_ms) < MIN_RUNS:
-            return {}, f"HARNESS_INVALID: tier={tier} has runs={len(samples_ms)} < {MIN_RUNS}"
+        if len(samples_ms) < min_runs:
+            return {}, {}, f"HARNESS_INVALID: tier={tier} has runs={len(samples_ms)} < {min_runs}"
 
         if "peak_kb" in obj:
             peak_kb = float(obj["peak_kb"])
@@ -1169,11 +1220,12 @@ def _parse_metric_lines(log_text: str, cli_warmup: int) -> Tuple[Dict[str, Dict[
 
         r_hash = str(obj.get("result_hash", "")).strip()
         if not r_hash:
-            return {}, f"HARNESS_INVALID: tier={tier} missing result_hash"
+            return {}, {}, f"HARNESS_INVALID: tier={tier} missing result_hash"
 
         tiers[tier] = _compute_tier_stats(tier, w, samples_ms, peak_kb, r_hash)
+        raw_samples[tier] = samples_ms
 
-    return tiers, None
+    return tiers, raw_samples, None
 
 
 def _run_subprocess_once(
@@ -1250,11 +1302,10 @@ def _format_bench_digest(
     return "\n".join(lines[:10])
 
 
-def execute_bench_run(
+def _run_bench_leg(
     root: Path,
     s_dir: Path,
     cache_dir: Path,
-    target_id: str,
     phase: str,
     cmd_tokens: List[str],
     warmup: int,
@@ -1262,15 +1313,9 @@ def execute_bench_run(
     tier_filter: str = "all",
     cwd_arg: Optional[str] = None,
     timeout: int = 300,
-) -> Tuple[int, Dict[str, Any], str]:
-    """Core statistical benchmark runner used by both bench-run and verify-opt."""
-    if warmup < MIN_WARMUP:
-        raise SystemExit(f"[vp.py] ERROR: --warmup must be >= {MIN_WARMUP} (got {warmup})")
-    if runs < MIN_RUNS:
-        raise SystemExit(f"[vp.py] ERROR: --runs must be >= {MIN_RUNS} (got {runs})")
-    if not cmd_tokens:
-        raise SystemExit("[vp.py] ERROR: Missing command after --")
-
+    min_runs: int = MIN_RUNS,
+) -> Tuple[int, Dict[str, Dict[str, Any]], Dict[str, List[float]], str, Path, str]:
+    """Execute one benchmark leg (Mode A VERIPERF_METRIC or Mode B subprocess fallback)."""
     sb_opt = s_dir / "sandbox-opt"
     if cwd_arg:
         cwd = Path(cwd_arg)
@@ -1293,71 +1338,108 @@ def execute_bench_run(
     )
     resolved_cmd = resolve_executable(_resolve_bughunt_cmd_paths(cmd_tokens, root), cwd, env)
 
-    # First execution: detects Mode A (VERIPERF_METRIC:) vs Mode B (external subprocess timing)
-    rc, first_out, first_ms, first_peak_kb = _run_subprocess_once(resolved_cmd, cwd, env, timeout)
-    log_file = s_dir / "logs" / f"{target_id}_{phase}.log"
-    json_file = s_dir / "logs" / f"{target_id}_{phase}.json"
-
+    rc, first_out, _, first_peak_kb = _run_subprocess_once(resolved_cmd, cwd, env, timeout)
     if rc != 0:
-        log_file.write_text(
-            f"$ {' '.join(cmd_tokens)}\nCWD: {cwd}\nexit={rc}\n{first_out}\n",
-            encoding="utf-8",
-        )
         tail = " | ".join(ln.strip() for ln in first_out.splitlines()[-4:] if ln.strip())
-        msg = f"[vp bench-run] id={target_id} phase={phase} status=ERROR exit={rc}\n{trunc(tail, 200)}"
-        return 1, {"status": "ERROR", "exit_code": rc}, msg
+        err_log = f"$ {' '.join(cmd_tokens)}\nCWD: {cwd}\nexit={rc}\n{first_out}\n"
+        return 1, {}, {}, f"status=ERROR exit={rc}: {trunc(tail, 180)}", cwd, err_log
 
-    tiers, parse_err = _parse_metric_lines(first_out, warmup)
+    tiers, raw_samples, parse_err = _parse_metric_lines(first_out, warmup, min_runs=min_runs)
     if parse_err:
-        log_file.write_text(f"$ {' '.join(cmd_tokens)}\nexit={rc}\n{first_out}\n", encoding="utf-8")
-        return 1, {"status": "HARNESS_INVALID", "error": parse_err}, f"[vp bench-run] {parse_err}"
+        return 1, {}, {}, parse_err, cwd, f"$ {' '.join(cmd_tokens)}\nexit={rc}\n{first_out}\n"
 
     if tiers:
-        mode_label = "harness"
         if tier_filter != "all":
             if tier_filter not in tiers:
                 return (
                     1,
-                    {"status": "HARNESS_INVALID", "error": f"Missing tier {tier_filter}"},
-                    f"[vp bench-run] ERROR: requested --tier {tier_filter} not found in {list(tiers.keys())}",
+                    {},
+                    {},
+                    f"ERROR: requested --tier {tier_filter} not found in {list(tiers.keys())}",
+                    cwd,
+                    first_out,
                 )
             tiers = {tier_filter: tiers[tier_filter]}
+            raw_samples = {tier_filter: raw_samples[tier_filter]}
         raw_log_text = f"$ {' '.join(cmd_tokens)}\nCWD: {cwd}\nexit={rc}\n{first_out}\n"
-    else:
-        # Mode B: external subprocess timing (first run counts as warmup #1)
-        mode_label = "subprocess"
-        for w_idx in range(1, warmup):
-            w_rc, w_out, _, _ = _run_subprocess_once(resolved_cmd, cwd, env, timeout)
-            if w_rc != 0:
-                log_file.write_text(f"Warmup {w_idx + 1} failed exit={w_rc}\n{w_out}\n", encoding="utf-8")
-                return 1, {"status": "ERROR", "exit_code": w_rc}, f"[vp bench-run] Warmup {w_idx + 1} failed exit={w_rc}"
+        return 0, tiers, raw_samples, "harness", cwd, raw_log_text
 
-        samples_ms: List[float] = []
-        peak_vals: List[float] = []
-        hashes: List[str] = []
-        last_out = first_out
-        for r_idx in range(runs):
-            r_rc, r_out, r_ms, r_peak = _run_subprocess_once(resolved_cmd, cwd, env, timeout)
-            if r_rc != 0:
-                log_file.write_text(f"Timed run {r_idx + 1} failed exit={r_rc}\n{r_out}\n", encoding="utf-8")
-                return 1, {"status": "ERROR", "exit_code": r_rc}, f"[vp bench-run] Timed run {r_idx + 1} failed exit={r_rc}"
-            samples_ms.append(r_ms)
-            if r_peak > 0:
-                peak_vals.append(r_peak)
-            norm = r_out.replace("\r\n", "\n").strip()
-            hashes.append(hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16])
-            last_out = r_out
+    # Mode B: external subprocess timing (first execution served as warmup #1)
+    for w_idx in range(1, warmup):
+        w_rc, w_out, _, _ = _run_subprocess_once(resolved_cmd, cwd, env, timeout)
+        if w_rc != 0:
+            return 1, {}, {}, f"Warmup {w_idx + 1} failed exit={w_rc}", cwd, w_out
 
-        unique_hashes = list(dict.fromkeys(hashes))
-        final_hash = unique_hashes[0] if len(unique_hashes) == 1 else f"VARIES:{unique_hashes[0]}"
-        peak_kb = max(peak_vals) if peak_vals else first_peak_kb
-        t_name = "default" if tier_filter == "all" else tier_filter
-        tiers = {t_name: _compute_tier_stats(t_name, warmup, samples_ms, peak_kb, final_hash)}
-        raw_log_text = (
-            f"$ {' '.join(cmd_tokens)}\nCWD: {cwd}\nmode=subprocess warmup={warmup} runs={runs}\n"
-            f"samples_ms={[round(x, 3) for x in samples_ms]}\nlast_stdout:\n{last_out}\n"
-        )
+    samples_ms: List[float] = []
+    peak_vals: List[float] = []
+    hashes: List[str] = []
+    last_out = first_out
+    for r_idx in range(runs):
+        r_rc, r_out, r_ms, r_peak = _run_subprocess_once(resolved_cmd, cwd, env, timeout)
+        if r_rc != 0:
+            return 1, {}, {}, f"Timed run {r_idx + 1} failed exit={r_rc}", cwd, r_out
+        samples_ms.append(r_ms)
+        if r_peak > 0:
+            peak_vals.append(r_peak)
+        norm = r_out.replace("\r\n", "\n").strip()
+        hashes.append(hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16])
+        last_out = r_out
 
+    unique_hashes = list(dict.fromkeys(hashes))
+    final_hash = unique_hashes[0] if len(unique_hashes) == 1 else f"VARIES:{unique_hashes[0]}"
+    peak_kb = max(peak_vals) if peak_vals else first_peak_kb
+    t_name = "default" if tier_filter == "all" else tier_filter
+    tiers = {t_name: _compute_tier_stats(t_name, warmup, samples_ms, peak_kb, final_hash)}
+    raw_samples = {t_name: samples_ms}
+    raw_log_text = (
+        f"$ {' '.join(cmd_tokens)}\nCWD: {cwd}\nmode=subprocess warmup={warmup} runs={runs}\n"
+        f"samples_ms={[round(x, 3) for x in samples_ms]}\nlast_stdout:\n{last_out}\n"
+    )
+    return 0, tiers, raw_samples, "subprocess", cwd, raw_log_text
+
+
+def execute_bench_run(
+    root: Path,
+    s_dir: Path,
+    cache_dir: Path,
+    target_id: str,
+    phase: str,
+    cmd_tokens: List[str],
+    warmup: int,
+    runs: int,
+    tier_filter: str = "all",
+    cwd_arg: Optional[str] = None,
+    timeout: int = 300,
+) -> Tuple[int, Dict[str, Any], str]:
+    """Core statistical benchmark runner used by both bench-run and verify-opt."""
+    if warmup < MIN_WARMUP:
+        raise SystemExit(f"[vp.py] ERROR: --warmup must be >= {MIN_WARMUP} (got {warmup})")
+    if runs < MIN_RUNS:
+        raise SystemExit(f"[vp.py] ERROR: --runs must be >= {MIN_RUNS} (got {runs})")
+    if not cmd_tokens:
+        raise SystemExit("[vp.py] ERROR: Missing command after --")
+
+    log_file = s_dir / "logs" / f"{target_id}_{phase}.log"
+    json_file = s_dir / "logs" / f"{target_id}_{phase}.json"
+
+    rc, tiers, _, mode_or_err, cwd, raw_log_text = _run_bench_leg(
+        root=root,
+        s_dir=s_dir,
+        cache_dir=cache_dir,
+        phase=phase,
+        cmd_tokens=cmd_tokens,
+        warmup=warmup,
+        runs=runs,
+        tier_filter=tier_filter,
+        cwd_arg=cwd_arg,
+        timeout=timeout,
+        min_runs=MIN_RUNS,
+    )
+    if rc != 0:
+        log_file.write_text(raw_log_text, encoding="utf-8")
+        return 1, {"status": "ERROR", "error": mode_or_err}, f"[vp bench-run] id={target_id} phase={phase} {mode_or_err}"
+
+    mode_label = mode_or_err
     primary = _select_primary_tier(tiers)
     payload = {
         "id": target_id,
@@ -1460,6 +1542,149 @@ def _run_correctness_tests(
     return True, f"PASS ({elapsed_ms:.0f}ms)", test_log
 
 
+def _compute_tier_comparison(b: Dict[str, Any], o: Dict[str, Any]) -> Dict[str, Any]:
+    b_hash = str(b.get("result_hash", ""))
+    o_hash = str(o.get("result_hash", ""))
+    h_match = bool(
+        b_hash and o_hash and b_hash == o_hash
+        and not b_hash.startswith("VARIES:") and not o_hash.startswith("VARIES:")
+    )
+    b_p50, o_p50 = float(b["p50_ms"]), float(o["p50_ms"])
+    b_p95, o_p95 = float(b["p95_ms"]), float(o["p95_ms"])
+    b_mem, o_mem = float(b.get("peak_kb", 0.0)), float(o.get("peak_kb", 0.0))
+
+    p50_sp = ((b_p50 - o_p50) / b_p50 * 100.0) if b_p50 > 0 else 0.0
+    p95_sp = ((b_p95 - o_p95) / b_p95 * 100.0) if b_p95 > 0 else 0.0
+    factor = (b_p50 / o_p50) if o_p50 > 0 else 9999.0
+    mem_red = ((b_mem - o_mem) / b_mem * 100.0) if b_mem > 0 else 0.0
+    mem_growth = ((o_mem - b_mem) / b_mem * 100.0) if b_mem > 0 else 0.0
+    return {
+        "base_p50_ms": b_p50,
+        "opt_p50_ms": o_p50,
+        "p50_speedup_pct": round(p50_sp, 2),
+        "speedup_factor": round(factor, 2),
+        "base_p95_ms": b_p95,
+        "opt_p95_ms": o_p95,
+        "p95_speedup_pct": round(p95_sp, 2),
+        "base_peak_kb": b_mem,
+        "opt_peak_kb": o_mem,
+        "mem_reduction_pct": round(mem_red, 2),
+        "mem_growth_pct": round(mem_growth, 2),
+        "base_hash": b_hash,
+        "opt_hash": o_hash,
+        "hash_match": h_match,
+    }
+
+
+def _should_interleave(
+    mode: str,
+    primary_comp: Dict[str, Any],
+    base_tier: Dict[str, Any],
+    opt_tier: Dict[str, Any],
+    min_speedup: float,
+) -> Tuple[bool, str]:
+    if mode == "off":
+        return False, ""
+    if mode == "always":
+        return True, "forced (--interleave=always)"
+    p50_gain = float(primary_comp["p50_speedup_pct"])
+    if abs(p50_gain - min_speedup) <= 3.0:
+        return True, f"borderline speedup ({p50_gain:+.1f}% near {min_speedup:.1f}%)"
+    max_cv = max(float(base_tier.get("cv_pct", 0.0)), float(opt_tier.get("cv_pct", 0.0)))
+    if max_cv > 5.0:
+        return True, f"high variance (cv={max_cv:.1f}% > 5.0%)"
+    return False, ""
+
+
+def _run_interleaved_ab(
+    root: Path,
+    s_dir: Path,
+    cache_dir: Path,
+    base_cmd: List[str],
+    opt_cmd: List[str],
+    primary_tier: str,
+    rounds: int,
+    runs_per_phase: int,
+    base_cwd: Optional[str],
+    opt_cwd: Optional[str],
+    timeout: int,
+) -> Tuple[bool, Dict[str, Any], Dict[str, Any], str]:
+    """Run counterbalanced ABBA interleaved rounds on primary_tier to defeat thermal/CPU drift."""
+    leg_warmup = MIN_WARMUP
+    leg_runs = max(8, runs_per_phase // 2)
+    pooled_samples: Dict[str, List[float]] = {"baseline": [], "opt": []}
+    pooled_peaks: Dict[str, List[float]] = {"baseline": [], "opt": []}
+    pooled_hashes: Dict[str, List[str]] = {"baseline": [], "opt": []}
+
+    for r_idx in range(max(2, rounds)):
+        pair = ("baseline", "opt") if r_idx % 2 == 0 else ("opt", "baseline")
+        for leg_phase in pair:
+            cmd_tok = base_cmd if leg_phase == "baseline" else opt_cmd
+            cwd_val = base_cwd if leg_phase == "baseline" else opt_cwd
+            rc, tiers, raw_s, mode_err, _, _ = _run_bench_leg(
+                root=root,
+                s_dir=s_dir,
+                cache_dir=cache_dir,
+                phase=leg_phase,
+                cmd_tokens=cmd_tok,
+                warmup=leg_warmup,
+                runs=leg_runs,
+                tier_filter=primary_tier,
+                cwd_arg=cwd_val,
+                timeout=timeout,
+                min_runs=leg_runs,
+            )
+            if rc != 0 or primary_tier not in tiers:
+                return False, {}, {}, f"interleave leg failed ({leg_phase}): {mode_err}"
+            pooled_samples[leg_phase].extend(raw_s[primary_tier])
+            pooled_peaks[leg_phase].append(float(tiers[primary_tier].get("peak_kb", 0.0)))
+            pooled_hashes[leg_phase].append(str(tiers[primary_tier].get("result_hash", "")))
+
+    def _agg_hash(hs: List[str]) -> str:
+        uniq = list(dict.fromkeys(hs))
+        return uniq[0] if len(uniq) == 1 else f"VARIES:{uniq[0]}"
+
+    new_base = _compute_tier_stats(
+        primary_tier,
+        leg_warmup,
+        pooled_samples["baseline"],
+        statistics.median(pooled_peaks["baseline"]),
+        _agg_hash(pooled_hashes["baseline"]),
+    )
+    new_opt = _compute_tier_stats(
+        primary_tier,
+        leg_warmup,
+        pooled_samples["opt"],
+        statistics.median(pooled_peaks["opt"]),
+        _agg_hash(pooled_hashes["opt"]),
+    )
+    return True, new_base, new_opt, f"{rounds} counterbalanced rounds x {leg_runs} samples"
+
+
+def _checkpoint_dir(s_dir: Path, name: str) -> Path:
+    return s_dir / "tmp" / "checkpoints" / sanitize_id(name)
+
+
+def _save_sandbox_checkpoint(root: Path, s_dir: Path, name: str) -> Tuple[Path, int]:
+    opt_dir = s_dir / "sandbox-opt"
+    if not opt_dir.is_dir():
+        raise SystemExit(f"[vp.py] ERROR: {opt_dir} not found; run sandbox --mode opt first")
+    dest = _checkpoint_dir(s_dir, name)
+    if dest.exists():
+        _remove_readonly_and_rmtree(dest)
+    global_excl, root_excl = _compute_sandbox_exclusions(root, [])
+    copied = _copy_project_tree(opt_dir, dest, global_excl, root_excl)
+    return dest, copied
+
+
+def _restore_sandbox_from(root: Path, s_dir: Path, src_dir: Path) -> int:
+    opt_dir = s_dir / "sandbox-opt"
+    if opt_dir.exists():
+        _remove_readonly_and_rmtree(opt_dir)
+    global_excl, root_excl = _compute_sandbox_exclusions(root, [])
+    return _copy_project_tree(src_dir, opt_dir, global_excl, root_excl)
+
+
 def cmd_verify_opt(args: argparse.Namespace) -> int:
     root, s_dir, _, cache_dir = resolve_session(args.s, args.root)
     tid = sanitize_id(args.id)
@@ -1469,6 +1694,9 @@ def cmd_verify_opt(args: argparse.Namespace) -> int:
         raise SystemExit(
             f"[vp.py] ERROR: --min-speedup={min_speedup} violates hard floor ({HARD_MIN_SPEEDUP_PCT:.1f}%)"
         )
+    max_mem_growth = float(args.max_mem_growth)
+    if max_mem_growth < 0.0:
+        raise SystemExit(f"[vp.py] ERROR: --max-mem-growth must be >= 0.0 (got {max_mem_growth})")
 
     base_json_path = s_dir / "logs" / f"{tid}_baseline.json"
     if not base_json_path.is_file():
@@ -1499,7 +1727,7 @@ def cmd_verify_opt(args: argparse.Namespace) -> int:
     else:
         opt_data = json.loads(opt_json_path.read_text(encoding="utf-8"))
 
-    # Gate 1: Correctness tests + Deterministic output hash
+    # Gate 1: Correctness tests
     test_ok = True
     test_detail = "SKIPPED (no --test-cmd)"
     if args.test_cmd:
@@ -1515,45 +1743,46 @@ def cmd_verify_opt(args: argparse.Namespace) -> int:
     if not shared_tiers:
         raise SystemExit("[vp.py] ERROR: Baseline and opt logs share no matching workload tiers")
 
-    hash_mismatches: List[str] = []
-    comparisons: Dict[str, Dict[str, Any]] = {}
-    for t in shared_tiers:
-        b = base_tiers[t]
-        o = opt_tiers[t]
-        b_hash = str(b.get("result_hash", ""))
-        o_hash = str(o.get("result_hash", ""))
-        h_match = bool(b_hash and o_hash and b_hash == o_hash and not b_hash.startswith("VARIES:") and not o_hash.startswith("VARIES:"))
-        if not h_match:
-            hash_mismatches.append(f"{t}({b_hash}!={o_hash})")
+    comparisons: Dict[str, Dict[str, Any]] = {
+        t: _compute_tier_comparison(base_tiers[t], opt_tiers[t]) for t in shared_tiers
+    }
+    primary_tier = _select_primary_tier({t: base_tiers[t] for t in shared_tiers}, preferred=args.primary_tier)
 
-        b_p50 = float(b["p50_ms"])
-        o_p50 = float(o["p50_ms"])
-        b_p95 = float(b["p95_ms"])
-        o_p95 = float(o["p95_ms"])
-        b_mem = float(b.get("peak_kb", 0.0))
-        o_mem = float(o.get("peak_kb", 0.0))
+    # Interleaved A/B Re-Verification on borderline or high-variance results
+    interleave_info: Dict[str, Any] = {"triggered": False, "reason": ""}
+    should_il, il_reason = _should_interleave(
+        args.interleave, comparisons[primary_tier], base_tiers[primary_tier], opt_tiers[primary_tier], min_speedup
+    )
+    if should_il and test_ok:
+        base_cmd = list(base_data.get("cmd", []))
+        opt_cmd = list(opt_data.get("cmd", base_cmd))
+        if base_cmd and opt_cmd:
+            il_ok, il_base, il_opt, il_detail = _run_interleaved_ab(
+                root=root,
+                s_dir=s_dir,
+                cache_dir=cache_dir,
+                base_cmd=base_cmd,
+                opt_cmd=opt_cmd,
+                primary_tier=primary_tier,
+                rounds=int(args.interleave_rounds),
+                runs_per_phase=int(args.runs),
+                base_cwd=base_data.get("cwd"),
+                opt_cwd=args.cwd,
+                timeout=int(args.timeout),
+            )
+            if il_ok:
+                base_tiers[primary_tier] = il_base
+                opt_tiers[primary_tier] = il_opt
+                comparisons[primary_tier] = _compute_tier_comparison(il_base, il_opt)
+                interleave_info = {"triggered": True, "reason": il_reason, "detail": il_detail}
+            else:
+                interleave_info = {"triggered": False, "reason": f"{il_reason} (skipped: {il_detail})"}
 
-        p50_sp = ((b_p50 - o_p50) / b_p50 * 100.0) if b_p50 > 0 else 0.0
-        p95_sp = ((b_p95 - o_p95) / b_p95 * 100.0) if b_p95 > 0 else 0.0
-        factor = (b_p50 / o_p50) if o_p50 > 0 else 9999.0
-        mem_red = ((b_mem - o_mem) / b_mem * 100.0) if b_mem > 0 else 0.0
-
-        comparisons[t] = {
-            "base_p50_ms": b_p50,
-            "opt_p50_ms": o_p50,
-            "p50_speedup_pct": round(p50_sp, 2),
-            "speedup_factor": round(factor, 2),
-            "base_p95_ms": b_p95,
-            "opt_p95_ms": o_p95,
-            "p95_speedup_pct": round(p95_sp, 2),
-            "base_peak_kb": b_mem,
-            "opt_peak_kb": o_mem,
-            "mem_reduction_pct": round(mem_red, 2),
-            "base_hash": b_hash,
-            "opt_hash": o_hash,
-            "hash_match": h_match,
-        }
-
+    hash_mismatches = [
+        f"{t}({comparisons[t]['base_hash']}!={comparisons[t]['opt_hash']})"
+        for t in shared_tiers
+        if not comparisons[t]["hash_match"]
+    ]
     gate1_pass = bool(test_ok and not hash_mismatches)
     if not test_ok:
         gate1_status = f"FAIL (TEST_FAILURE: {test_detail})"
@@ -1562,10 +1791,16 @@ def cmd_verify_opt(args: argparse.Namespace) -> int:
     else:
         gate1_status = f"PASS (tests={test_detail}, hashes=MATCH)"
 
-    primary_tier = _select_primary_tier({t: base_tiers[t] for t in shared_tiers}, preferred=args.primary_tier)
     pc = comparisons[primary_tier]
     p50_gain = pc["p50_speedup_pct"]
     p95_gain = pc["p95_speedup_pct"]
+    mem_growth = pc["mem_growth_pct"]
+    abs_mem_delta_kb = pc["opt_peak_kb"] - pc["base_peak_kb"]
+    mem_blowup = (
+        (not args.allow_mem_tradeoff)
+        and abs_mem_delta_kb > MEM_NOISE_DEADBAND_KB
+        and mem_growth > max_mem_growth
+    )
 
     if p50_gain < min_speedup:
         gate2_pass = False
@@ -1573,9 +1808,13 @@ def cmd_verify_opt(args: argparse.Namespace) -> int:
     elif p95_gain < 0.0:
         gate2_pass = False
         gate2_status = f"FAIL (P95_REGRESSION: {p95_gain:+.1f}% < 0.0%)"
+    elif mem_blowup:
+        gate2_pass = False
+        gate2_status = f"FAIL (MEMORY_BLOWUP: +{mem_growth:.1f}% > +{max_mem_growth:.1f}% ceiling)"
     else:
         gate2_pass = True
-        gate2_status = f"PASS ({p50_gain:+.1f}% >= {min_speedup:.1f}%, p95={p95_gain:+.1f}%)"
+        mem_note = "mem=TRADEOFF_ALLOWED" if args.allow_mem_tradeoff else f"mem={mem_growth:+.1f}%<=+{max_mem_growth:.0f}%"
+        gate2_status = f"PASS ({p50_gain:+.1f}% >= {min_speedup:.1f}%, p95={p95_gain:+.1f}%, {mem_note})"
 
     if gate1_pass and gate2_pass:
         verdict = "ACCEPTED"
@@ -1589,21 +1828,45 @@ def cmd_verify_opt(args: argparse.Namespace) -> int:
     elif p50_gain < min_speedup:
         verdict = "REJECTED"
         reason = "REJECTED_INSUFFICIENT_GAIN"
-    else:
+    elif p95_gain < 0.0:
         verdict = "REJECTED"
         reason = "REJECTED_P95_REGRESSION"
+    else:
+        verdict = "REJECTED"
+        reason = "REJECTED_MEMORY_BLOWUP"
+
+    # Deterministic Sandbox Checkpoint / Auto-Rollback
+    rollback_info: Dict[str, Any] = {"restored": False, "source": ""}
+    if (s_dir / "sandbox-opt").is_dir():
+        if verdict == "ACCEPTED":
+            _save_sandbox_checkpoint(root, s_dir, "_last_accepted")
+        elif args.auto_rollback:
+            cand_id = _checkpoint_dir(s_dir, tid)
+            cand_last = _checkpoint_dir(s_dir, "_last_accepted")
+            if cand_id.is_dir():
+                src_dir, src_lbl = cand_id, f"checkpoint:{tid}"
+            elif cand_last.is_dir():
+                src_dir, src_lbl = cand_last, "checkpoint:_last_accepted"
+            else:
+                src_dir, src_lbl = root, "ROOT"
+            _restore_sandbox_from(root, s_dir, src_dir)
+            rollback_info = {"restored": True, "source": src_lbl}
 
     verify_payload = {
         "id": tid,
         "verdict": verdict,
         "reason": reason,
         "min_speedup_pct": min_speedup,
+        "max_mem_growth_pct": max_mem_growth,
+        "allow_mem_tradeoff": bool(args.allow_mem_tradeoff),
         "primary_tier": primary_tier,
         "gate1_pass": gate1_pass,
         "gate1_detail": gate1_status,
         "gate2_pass": gate2_pass,
         "gate2_detail": gate2_status,
         "test_status": test_detail,
+        "interleaved_ab": interleave_info,
+        "rollback": rollback_info,
         "comparisons": comparisons,
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -1615,7 +1878,7 @@ def cmd_verify_opt(args: argparse.Namespace) -> int:
         f"[vp verify-opt] id={tid} primary={primary_tier} verdict={verdict} ({reason})",
         "tier     | base_p50  | opt_p50   | speedup | base_p95  | opt_p95   | mem_delta | hash",
     ]
-    for t in shared_tiers[:6]:
+    for t in shared_tiers[:5]:
         c = comparisons[t]
         h_lbl = "MATCH" if c["hash_match"] else "MISMATCH"
         out_lines.append(
@@ -1623,8 +1886,13 @@ def cmd_verify_opt(args: argparse.Namespace) -> int:
             f"{c['base_p95_ms']:>7.2f}ms | {c['opt_p95_ms']:>7.2f}ms | {c['mem_reduction_pct']:>+8.1f}% | {h_lbl}"
         )
     out_lines.append(f"Gate 1 (Correctness): {gate1_status}")
-    out_lines.append(f"Gate 2 (>={min_speedup:.0f}% Speed): {gate2_status}")
-    out_lines.append(f"saved={rel_posix(verify_path, root)}")
+    out_lines.append(f"Gate 2 (>={min_speedup:.0f}% Speed / <=+{max_mem_growth:.0f}% Mem): {gate2_status}")
+    extras: List[str] = [f"saved={rel_posix(verify_path, root)}"]
+    if interleave_info["triggered"]:
+        extras.append(f"interleaved=YES ({interleave_info['reason']})")
+    if rollback_info["restored"]:
+        extras.append(f"rollback=AUTO_RESTORED ({rollback_info['source']})")
+    out_lines.append(" | ".join(extras))
     print("\n".join(out_lines[:12]))
     return 0
 
@@ -1728,6 +1996,25 @@ def cmd_sandbox(args: argparse.Namespace) -> int:
         copied = _copy_project_tree(root, target, global_excl, root_excl)
         dur = time.monotonic() - t0
         print(f"[vp sandbox {args.mode}] path={rel_posix(target, root)} files={copied} duration={dur:.2f}s")
+        return 0
+
+    if args.mode == "save":
+        if not args.id:
+            raise SystemExit("[vp.py] ERROR: --id is required for sandbox --mode save")
+        dest, copied = _save_sandbox_checkpoint(root, s_dir, args.id)
+        print(f"[vp sandbox save] id={sanitize_id(args.id)} path={rel_posix(dest, root)} files={copied}")
+        return 0
+
+    if args.mode == "rollback":
+        if not args.id:
+            raise SystemExit("[vp.py] ERROR: --id is required for sandbox --mode rollback")
+        ckpt = _checkpoint_dir(s_dir, args.id)
+        if ckpt.is_dir():
+            src_dir, src_lbl = ckpt, rel_posix(ckpt, root)
+        else:
+            src_dir, src_lbl = root, "ROOT"
+        copied = _restore_sandbox_from(root, s_dir, src_dir)
+        print(f"[vp sandbox rollback] id={sanitize_id(args.id)} restored_from={src_lbl} files={copied}")
         return 0
 
     if args.mode == "diff":
@@ -1891,7 +2178,7 @@ def cmd_summary(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vp.py",
-        description="VeriPerf v1.0 CLI: hotspot scan, statistical benchmarking, and dual-gate verification.",
+        description="VeriPerf v1.1 CLI: hotspot scan, statistical benchmarking, dual-gate verification & checkpoints.",
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
@@ -1920,10 +2207,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("cmd", nargs=argparse.REMAINDER, help="Benchmark command after --")
     p_bench.set_defaults(func=cmd_bench_run)
 
-    p_ver = sub.add_parser("verify-opt", help="Run Dual Gate Check (correctness/hash AND >=15% speedup)")
+    p_ver = sub.add_parser("verify-opt", help="Run Dual Gate Check (correctness/hash, >=15% speedup, mem ceiling, ABBA interleave)")
     p_ver.add_argument("--s", required=True, help="Session directory path")
     p_ver.add_argument("--id", required=True, help="Target optimization ID")
     p_ver.add_argument("--min-speedup", type=float, default=15.0, help="Minimum p50 speedup %% (>=15.0)")
+    p_ver.add_argument("--max-mem-growth", type=float, default=DEFAULT_MAX_MEM_GROWTH_PCT, help="Max peak memory growth %% (default 25.0)")
+    p_ver.add_argument("--allow-mem-tradeoff", action="store_true", help="Bypass memory ceiling when user allows RAM-for-speed tradeoff")
+    p_ver.add_argument("--interleave", choices=("auto", "always", "off"), default="auto", help="Counterbalanced A/B re-verification mode")
+    p_ver.add_argument("--interleave-rounds", type=int, default=4, help="ABBA round pairs when interleaved (default 4)")
+    p_ver.add_argument("--auto-rollback", action="store_true", help="Automatically restore S/sandbox-opt to checkpoint on REJECTED")
     p_ver.add_argument("--primary-tier", default="large", help="Primary workload tier (default: large)")
     p_ver.add_argument("--opt-bench-cmd", default=None, help="Benchmark command string for sandbox-opt")
     p_ver.add_argument("--test-cmd", default=None, help="Project test command string for Gate 1")
@@ -1935,9 +2227,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_ver.add_argument("--root", default=None, help="Project ROOT override")
     p_ver.set_defaults(func=cmd_verify_opt)
 
-    p_sb = sub.add_parser("sandbox", help="Manage S/sandbox-opt, compact diff, and cleanliness check")
+    p_sb = sub.add_parser("sandbox", help="Manage S/sandbox-opt, per-target checkpoints, compact diff, and cleanliness check")
     p_sb.add_argument("--s", required=True, help="Session directory path")
-    p_sb.add_argument("--mode", required=True, choices=("create", "opt", "diff", "clean"), help="Sandbox action")
+    p_sb.add_argument("--mode", required=True, choices=("create", "opt", "save", "rollback", "diff", "clean"), help="Sandbox action")
+    p_sb.add_argument("--id", default=None, help="Target ID for save/rollback checkpoint")
     p_sb.add_argument("--exclude", action="append", default=[], help="Extra dir names to exclude")
     p_sb.add_argument("--force", action="store_true", help="Overwrite existing sandbox directory")
     p_sb.add_argument("--root", default=None, help="Project ROOT override")
@@ -1955,6 +2248,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_sum.add_argument("--s", required=True, help="Session directory path")
     p_sum.add_argument("--root", default=None, help="Project ROOT override")
     p_sum.set_defaults(func=cmd_summary)
+
+    p_ch = sub.add_parser("canonical-hash", help="Compute canonical SHA-256[:16] digest for JSON data")
+    p_ch.add_argument("--float-digits", type=int, default=6, help="Decimal digits to round floats (default 6)")
+    p_ch.add_argument("--unordered-lists", action="store_true", help="Sort list elements canonically before hashing")
+    p_ch.add_argument("--json-str", default=None, help="JSON string (reads stdin if omitted)")
+    p_ch.set_defaults(func=cmd_canonical_hash)
 
     return parser
 
