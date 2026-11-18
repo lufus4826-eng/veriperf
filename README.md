@@ -65,6 +65,13 @@ python examples/portfolio_bench/run_demo.py
 
 ### Installation
 
+#### 0. Full VeriHunt Suite via VeriPilot (Recommended — One-Command Install)
+Install `VeriPilot` + `VeriPR` + `VeriHunt` + `VeriSec` + `VeriPerf` together across 6 agent platforms:
+```bash
+git clone https://github.com/lufus4826-eng/veripilot.git ~/.gemini/config/skills/veripilot
+python ~/.gemini/config/skills/veripilot/scripts/vpilot.py install --platform antigravity   # or --platform claude | --platform all
+```
+
 #### 1. Claude Code
 ```bash
 # User-global installation (Recommended)
@@ -200,7 +207,9 @@ veriperf/
 
 ## VeriHunt Ecosystem
 
-VeriPerf pairs directly with **[VeriHunt](https://github.com/lufus4826-eng/verihunt)** and **[VeriSec](https://github.com/lufus4826-eng/verisec)** using the shared `.bughunt/` workspace convention:
+VeriPerf pairs directly with **[VeriPilot (VeriHunt Suite)](https://github.com/lufus4826-eng/veripilot)** and the VeriHunt suite using the shared `.bughunt/` workspace convention:
+- Use **`/veripilot`** to auto-triage, route in strict Causal Order (`veripr -> verihunt -> verisec -> veriperf`), and chain patches over a Cumulative Overlay workspace.
+- Use **`/veripr`** right before commit/PR to catch 1-hop caller ripples and silent API `schema_hash` drift.
 - Use **`/verihunt`** to hunt and prove **correctness, edge-case, and concurrency bugs** (`FAIL` -> `PASS` in `sandbox-fix`).
 - Use **`/verisec`** to audit **business-logic & authorization flaws** (`IDOR/BOLA`, `Missing Auth Guard`, `Mass Assignment`, `Race Double-Spend`) with 100% network-isolated PoCs and secret redaction.
 - Use **`/veriperf`** once code is functionally sound and secure to eliminate **`O(N^2)` loops, N+1 I/O, and memory bloat** (`>= 15%` proven speedup in `sandbox-opt`).
