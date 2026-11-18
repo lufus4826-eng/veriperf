@@ -205,14 +205,19 @@ veriperf/
 
 ---
 
-## VeriHunt Ecosystem
+## Veri-Suite Ecosystem
 
-VeriPerf pairs directly with **[VeriPilot (VeriHunt Suite)](https://github.com/lufus4826-eng/veripilot)** and the VeriHunt suite using the shared `.bughunt/` workspace convention:
-- Use **`/veripilot`** to auto-triage, route in strict Causal Order (`veripr -> verihunt -> verisec -> veriperf`), and chain patches over a Cumulative Overlay workspace.
-- Use **`/veripr`** right before commit/PR to catch 1-hop caller ripples and silent API `schema_hash` drift.
-- Use **`/verihunt`** to hunt and prove **correctness, edge-case, and concurrency bugs** (`FAIL` -> `PASS` in `sandbox-fix`).
-- Use **`/verisec`** to audit **business-logic & authorization flaws** (`IDOR/BOLA`, `Missing Auth Guard`, `Mass Assignment`, `Race Double-Spend`) with 100% network-isolated PoCs and secret redaction.
-- Use **`/veriperf`** once code is functionally sound and secure to eliminate **`O(N^2)` loops, N+1 I/O, and memory bloat** (`>= 15%` proven speedup in `sandbox-opt`).
+[![Browse Veri-Suite](https://img.shields.io/badge/Catalog-Browse%20Only%20Veri--Suite%20(5)-2ea44f.svg)](https://github.com/lufus4826-eng?tab=repositories&q=topic%3Averi-suite)
+
+VeriPerf is part of the **Veri-Suite Ecosystem**, sharing the `.bughunt/` isolation convention and empirical Dual-Gate verification philosophy:
+
+| Skill | Role in Causal Chain | Pinned Release | Repository |
+|---|---|---|---|
+| **VeriPilot** | Hub, Smart Router, Cumulative Overlay & 1-Command Installer | `v1.0.1` | [`lufus4826-eng/veripilot`](https://github.com/lufus4826-eng/veripilot) |
+| **VeriPR** | Stage 1a: Pre-Commit & PR Differential Guard (`1-hop` ripple + `schema_hash`) | `v1.1.0` | [`lufus4826-eng/veripr`](https://github.com/lufus4826-eng/veripr) |
+| **VeriHunt** | Stage 1b: Deep Evidence-Based Bug Hunting & Sandbox Verifier | `v2.1.0` | [`lufus4826-eng/verihunt`](https://github.com/lufus4826-eng/verihunt) |
+| **VeriSec** | Stage 2: Defensive AppSec, Authz Invariant & Air-Gapped PoC Verifier | `v1.1.0` | [`lufus4826-eng/verisec`](https://github.com/lufus4826-eng/verisec) |
+| **VeriPerf** *(Current Repo)* | Stage 3: Statistical Profiling (`p50`/`p95`, Peak RAM, `ABBA` Interleaving) | `v1.1.1` | [`lufus4826-eng/veriperf`](https://github.com/lufus4826-eng/veriperf) |
 
 ---
 
