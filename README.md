@@ -200,9 +200,10 @@ veriperf/
 
 ## VeriHunt Ecosystem
 
-VeriPerf pairs directly with **[VeriHunt](https://github.com/lufus4826-eng/verihunt)** using the shared `.bughunt/` workspace convention:
-- Use **`/verihunt`** to hunt and prove **correctness, concurrency, and security bugs** (`FAIL` -> `PASS` in `sandbox-fix`).
-- Use **`/veriperf`** once code is functionally sound to eliminate **`O(N^2)` loops, N+1 I/O, and memory bloat** (`>= 15%` proven speedup in `sandbox-opt`).
+VeriPerf pairs directly with **[VeriHunt](https://github.com/lufus4826-eng/verihunt)** and **[VeriSec](https://github.com/lufus4826-eng/verisec)** using the shared `.bughunt/` workspace convention:
+- Use **`/verihunt`** to hunt and prove **correctness, edge-case, and concurrency bugs** (`FAIL` -> `PASS` in `sandbox-fix`).
+- Use **`/verisec`** to audit **business-logic & authorization flaws** (`IDOR/BOLA`, `Missing Auth Guard`, `Mass Assignment`, `Race Double-Spend`) with 100% network-isolated PoCs and secret redaction.
+- Use **`/veriperf`** once code is functionally sound and secure to eliminate **`O(N^2)` loops, N+1 I/O, and memory bloat** (`>= 15%` proven speedup in `sandbox-opt`).
 
 ---
 
